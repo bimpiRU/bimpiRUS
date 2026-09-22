@@ -1,0 +1,231 @@
+#!/bin/bash
+
+GLOBAL_START=$(date +%s)
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+show_help() {
+    echo -e "${GREEN}================================================================================${NC}"
+    echo -e "${GREEN}                       bimpiRUS — ПОЛНОЕ РУКОВОДСТВО ПО ФЛАГАМ                  ${NC}"
+    echo -e "${GREEN}================================================================================${NC}"
+    echo -e "Использование: bimpiRUS [ФЛАГ] [ЦЕЛЬ]"
+    echo -e ""
+    echo -e "Доступные режимы работы:"
+    echo -e "  ${CYAN}-sW${NC}          ${RED}БОЕВОЙ РЕЖИМ (W — ВПЕРЕД / ATTACK)${NC}"
+    echo -e "               (Сбор поддоменов -> Zero Trust скоринг -> Авто-атака целей Nmap/Nikto)"
+    echo -e ""
+    echo -e "  ${CYAN}-sQ${NC}          ${BLUE}ТИХИЙ РАЗВЕДЫВАТЕЛЬНЫЙ РЕЖИМ (Q — ТИХО / QUIET)${NC}"
+    echo -e "               (Сбор поддоменов -> Картирование WAF/Bypass -> Определение CMS WhatWeb)"
+    echo -e "               *Без проведения деструктивных атак и сканирования портов*"
+    echo -e ""
+    echo -e "  ${CYAN}-h, --help${NC}   Показать это справочное меню"
+    echo -e ""
+    echo -e "Примеры запуска:"
+    echo -e "  bimpiRUS -sW foxford.ru   (Запустить полный боевой цикл с атакой)"
+    echo -e "  bimpiRUS -sQ foxford.ru   (Только тихо собрать карту инфраструктуры через Tor)"
+    echo -e "${GREEN}================================================================================${NC}"
+    exit 0
+}
+
+if [ $# -eq 0 ]; then show_help; fi
+
+MODE=""
+TARGET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) show_help ;;
+        -sW) MODE="sW"; TARGET="$2"; shift 2 ;;
+        -sQ) MODE="sQ"; TARGET="$2"; shift 2 ;;
+        *) if [ -z "$TARGET" ] && [ -n "$MODE" ]; then TARGET="$1"; fi; shift ;;
+    esac
+done
+
+if [ -z "$MODE" ] || [ -z "$TARGET" ]; then
+    echo -e "${RED}[-][Ошибка] Неверный синтаксис!${NC}"
+    echo -e "Используйте: ${YELLOW}bimpiRUS -sW <цель>${NC} / ${YELLOW}bimpiRUS -sQ <цель>${NC} или ${YELLOW}bimpiRUS -h${NC}"
+    exit 1
+fi
+
+echo -e "${BLUE}[*] Запуск Core-Оркестратора bimpiRUS против: ${TARGET}...${NC}"
+if [ "$MODE" == "sW" ]; then
+    echo -e "${RED}[*] Контур: БОЕВОЙ РЕЖИМ (-sW) | Ротация Tor IP | Контроль зависаний утилит.${NC}"
+else
+    echo -e "${BLUE}[*] Контур: ТИХИЙ РЕЖИМ (-sQ) | Картирование сети через Tor | Без сканирования портов.${NC}"
+fi
+
+REQUIRED_APPS=("tor" "proxychains4" "nmap" "nikto" "subfinder" "host" "curl" "whatweb")
+MISSING_APPS=()
+for app in "${REQUIRED_APPS[@]}"; do
+    if ! command -v "$app" &> /dev/null; then
+        if [ "$app" == "proxychains4" ] && command -v proxychains &> /dev/null; then continue; fi
+        MISSING_APPS+=("$app")
+    fi
+done
+if [ ${#MISSING_APPS[@]} -gt 0 ]; then
+    echo -e "${YELLOW}[!] Дозагрузка необходимых инструментов...${NC}"
+    sudo apt update -y && sudo apt install -y "${MISSING_APPS[@]}" &>/dev/null
+fi
+
+if ! systemctl is-active --quiet tor; then sudo systemctl start tor && sleep 4; fi
+PC_CMD="proxychains4"
+command -v proxychains4 &> /dev/null || PC_CMD="proxychains"
+
+rotate_tor_ip() {
+    if nc -z -w 1 127.0.0.1 9051 2>/dev/null; then
+        echo -e 'AUTHENTICATE ""\nSIGNAL NEWNYM\nQUIT' | nc -w 1 127.0.0.1 9051 &>/dev/null
+    fi
+}
+
+draw_status() {
+    local percent=$1; local current=$2; local total=$3; local start_time=$4; local cmd_info=$5
+    local now=$(date +%s); local elapsed=$((now - start_time)); local eta_str="0s"
+    if [ $current -gt 0 ] && [ $elapsed -gt 0 ]; then
+        local remaining_seconds=$(( (total - current) * elapsed / current ))
+        if [ $remaining_seconds -gt 0 ]; then eta_str="${remaining_seconds}s"; fi
+    fi
+    local completed=$((percent / 5)); local remaining=$((20 - completed))
+    local progress_bar=$(printf "%0s" | tr ' ' '='); local empty_bar=$(printf "%0s" | tr ' ' '.')
+    printf "\r\033[K${CYAN}[Прогресс: %3d%% Осталось: %-4s] ${MAGENTA}Анализ: %-40s${NC}" "$percent" "$eta_str" "${cmd_info:0:40}"
+}
+
+echo -e "\n${YELLOW}[*] Шаг 1: Сканирование инфраструктуры и оценка рентабельности целей...${NC}"
+MAIN_IP=$(host "$TARGET" | grep -m1 "has address" | awk '{print $4}')
+if [ -z "$MAIN_IP" ]; then
+    echo -e "${RED}[-][Ошибка] Не удалось разрешить IP для $TARGET. Проверьте соединение.${NC}"
+    exit 1
+fi
+BASE_SUBNET=$(echo "$MAIN_IP" | cut -d'.' -f1-3)
+
+if command -v subfinder &> /dev/null; then
+    raw_subs=$(timeout 30 subfinder -d "$TARGET" -silent 2>/dev/null)
+fi
+if [ -z "$raw_subs" ]; then
+    raw_subs=$(echo -e "www.${TARGET}\nmail.${TARGET}\ndev.${TARGET}\napi.${TARGET}\ntest.${TARGET}\nstaging.${TARGET}\ndemo.${TARGET}\nvod.${TARGET}")
+fi
+
+readarray -t subdomains < <(echo "$raw_subs" | sort -u)
+TOTAL_SUBS=${#subdomains[@]}
+
+TARGET_HOSTS=()
+TARGET_IPS=()
+REPORT_PROFITABLE=""
+REPORT_ZERO_TRUST=""
+REPORT_WEB_TECH=""
+
+STAGE_START=$(date +%s)
+for i in "${!subdomains[@]}"; do
+    sub="${subdomains[$i]}"
+    CURRENT_TASK=$((i + 1))
+    PERCENT=$(( CURRENT_TASK * 100 / TOTAL_SUBS ))
+    
+    draw_status "$PERCENT" "$CURRENT_TASK" "$TOTAL_SUBS" "$STAGE_START" "Чек: $sub"
+    
+    SUB_IP=$(host -W 1 "$sub" | grep -m1 "has address" | awk '{print $4}')
+    if [ -n "$SUB_IP" ]; then
+        if echo "$SUB_IP" | grep -qE "^185\.65\.150\."; then continue; fi
+
+        web_headers=$($PC_CMD curl -s -I -m 3 "http://$sub" "https://$sub" 2>/dev/null)
+        
+        is_zerotrust="Нет"
+        if echo "$web_headers" | grep -qiE "cloudflare-access|cfp-cookie|oauth|sso|identity|beyondcorp|okta|keycloak|login\."; then
+            is_zerotrust="Да (Zero Trust / SSO Gateway)"
+        fi
+
+        if [ "$is_zerotrust" != "Нет" ]; then
+            REPORT_ZERO_TRUST="${REPORT_ZERO_TRUST}\n  [🔒 ZERO TRUST] Хост: $sub -> IP: $SUB_IP (Защищено экраном авторизации)"
+        else
+            if [[ "$SUB_IP" != "$BASE_SUBNET".* ]]; then type_label="🔥 КРИТИЧЕСКИЙ BYPASS"; else type_label="📌 ГОЛЫЙ УЗЕЛ"; fi
+            
+            printf "\r\033[K[${type_label}] Хост: %-30s -> IP: %-15s\n" "$sub" "$SUB_IP"
+            
+            TARGET_HOSTS+=("$sub")
+            TARGET_IPS+=("$SUB_IP")
+            REPORT_PROFITABLE="${REPORT_PROFITABLE}\n  [$type_label] $sub ($SUB_IP)"
+            
+            if [ "$MODE" == "sQ" ]; then
+                w_out=$($PC_CMD whatweb --max-threads=4 "$sub" 2>/dev/null | grep -oP 'HTTPServer\[.*?\]|Title\[.*?\]|CMS\[.*?\]' | tr '\n' ' ')
+                if [ -n "$w_out" ]; then
+                    REPORT_WEB_TECH="${REPORT_WEB_TECH}\n  [🌐 СТЕК] $sub: $w_out"
+                fi
+            fi
+        fi
+    fi
+done
+printf "\r\033[K${GREEN}[+] Фаза сбора инфраструктуры успешно завершена.${NC}\n"
+REPORT_VULNS=""
+
+if [ "$MODE" == "sW" ]; then
+    TOTAL_ATTACKS=${#TARGET_HOSTS[@]}
+    if [ $TOTAL_ATTACKS -eq 0 ]; then
+        echo -e "\n${GREEN}[+] Высокорентабельных незащищенных точек не найдено.${NC}"
+    else
+        echo -e "\n\n${RED}[*] Шаг 2: Скоростная атака на рентабельные цели ($TOTAL_ATTACKS хостов)...${NC}"
+        echo -e "${YELLOW}--------------------------------------------------------------------------------${NC}"
+
+        for i in "${!TARGET_HOSTS[@]}"; do
+            host="${TARGET_HOSTS[$i]}"
+            ip="${TARGET_IPS[$i]}"
+            
+            echo -e "\n${MAGENTA}[⚔️ АТАКА] -> $host [$ip]${NC}"
+            rotate_tor_ip
+            
+            echo -e "${BLUE}  [1/2] Быстрый поиск дыр в службах (Nmap Fast Vuln)...${NC}"
+            nmap_out=$(timeout 35 $PC_CMD nmap -sT -PN -p 80,443,22,8080 -sV --script=vuln --max-rtt-timeout 3s --max-retries 1 $ip 2>/dev/null)
+            if echo "$nmap_out" | grep -qi "VULNERABLE"; then
+                echo -e "${RED}  [🚨 ВЗЛОМ] Найдены уязвимости служб на $host!${NC}"
+                REPORT_VULNS="${REPORT_VULNS}\n  [❌ СЛУЖБА] $host ($ip) — Уязвимые порты."
+                echo "$nmap_out" | grep -iE "VULNERABLE|State:|IDs:" | sed 's/^/      /'
+            else
+                echo -e "${GREEN}  [+] Nmap завершен быстро (прямых дыр не обнаружено или таймаут).${NC}"
+            fi
+
+            echo -e "${BLUE}  [2/2] Быстрый поиск веб-уязвимостей (Nikto Light)...${NC}"
+            nikto_out=$(timeout 30 $PC_CMD nikto -h http://$host -Tuning 1,3,4 -maxtime 25s 2>/dev/null)
+            if echo "$nikto_out" | grep -qiE "OSVDB|Vulnerability|XSS|Remote|Sensitive"; then
+                echo -e "${RED}  [🚨 ВЗЛОМ] Найдены веб-бреши на $host!${NC}"
+                REPORT_VULNS="${REPORT_VULNS}\n  [❌ ВЕБ-ДЫРА] $host ($ip) — Критические веб-мисконфиги."
+                echo "$nikto_out" | grep -iE "OSVDB|Vulnerability|+ " | head -n 3 | sed 's/^/      /'
+            else
+                echo -e "${GREEN}  [+] Nikto завершен быстро (критических утечек не найдено или таймаут).${NC}"
+            fi
+            echo -e "${YELLOW}--------------------------------------------------------------------------------${NC}"
+        done
+    fi
+fi
+
+GLOBAL_END=$(date +%s)
+TOTAL_ELAPSED=$((GLOBAL_END - GLOBAL_START))
+
+echo -e "\n\n${GREEN}================================================================================${NC}"
+echo -e "${GREEN}                      bimpiRUS СВОДНЫЙ ТЕКСТОВЫЙ ОТЧЕТ СКАНИРОВАНИЯ             ${NC}"
+echo -e "${GREEN}================================================================================${NC}"
+echo -e " Исходная цель:       $TARGET"
+echo -e " Выбранный режим:     $([ "$MODE" == "sW" ] && echo "Боевой режим (-sW)" || echo "Тихий развед-режим (-sQ)")"
+echo -e " Общее время сессии:  ${TOTAL_ELAPSED} сек."
+echo -e "--------------------------------------------------------------------------------"
+echo -e "${YELLOW}[+] ВЫСОКОРЕНТАБЕЛЬНЫЕ КОНТУРЫ (БЕЗ ZERO TRUST / WAF):${NC}"
+if [ -n "$REPORT_PROFITABLE" ]; then echo -e "$REPORT_PROFITABLE"; else echo -e "  [-] Не найдено."; fi
+
+if [ "$MODE" == "sQ" ] && [ -n "$REPORT_WEB_TECH" ]; then
+    echo -e "--------------------------------------------------------------------------------"
+    echo -e "${MAGENTA}[+] ВЫЯВЛЕННЫЙ ТЕХНОЛОГИЧЕСКИЙ СТЕК ВЕБ-УЗЛОВ (WHATWEB):${NC}"
+    echo -e "$REPORT_WEB_TECH"
+fi
+
+echo -e "--------------------------------------------------------------------------------"
+echo -e "${CYAN}[+] ПРИКРЫТО ПАРАДИГМОЙ ZERO TRUST / IDENTITY SSO:${NC}"
+if [ -n "$REPORT_ZERO_TRUST" ]; then echo -e "$REPORT_ZERO_TRUST"; else echo -e "  [-] Не зафиксировано."; fi
+
+if [ "$MODE" == "sW" ]; then
+    echo -e "--------------------------------------------------------------------------------"
+    echo -e "${RED}[+] РЕЗУЛЬТАТЫ ПОПЫТОК АВТО-ВЗЛОМА ВЫСОКОРЕНТАБЕЛЬНЫХ ХОСТОВ:${NC}"
+    if [ -n "$REPORT_VULNS" ]; then echo -e "$REPORT_VULNS"; else echo -e "  ${GREEN}[-] Прямых критических уязвимостей в экспресс-режиме не обнаружено.${NC}"; fi
+fi
+echo -e "${GREEN}================================================================================${NC}"
