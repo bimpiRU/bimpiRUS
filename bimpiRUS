@@ -56,29 +56,29 @@ fi
 
 echo -e "${BLUE}[*] Запуск Core-Оркестратора bimpiRUS против: ${TARGET}...${NC}"
 if [ "$MODE" == "sW" ]; then
-    echo -e "${RED}[*] Контур: БОЕВОЙ РЕЖИМ (-sW) | Ротация Tor IP | Контроль зависаний утилит.${NC}"
+    echo -e "${RED}[*] Контур: БОЕВОЙ РЕЖИМ (-sW) | Full-Auto Tor | Контроль зависаний.${NC}"
 else
     echo -e "${BLUE}[*] Контур: ТИХИЙ РЕЖИМ (-sQ) | Картирование сети через Tor | Без сканирования портов.${NC}"
 fi
 
 # --- УСТАНОВКА ЗАВИСИМОСТЕЙ ---
 echo -e "${YELLOW}[*] Проверка зависимостей...${NC}"
-REQUIRED_APPS=("tor" "proxychains4" "nmap" "nikto" "host" "curl" "whatweb" "unzip" "wget")
+REQUIRED_APPS=("tor" "proxychains4" "nmap" "nikto" "host" "curl" "whatweb" "unzip" "wget" "netcat-openbsd")
 MISSING_APPS=()
 for app in "${REQUIRED_APPS[@]}"; do
     if ! command -v "$app" &> /dev/null; then
         if [ "$app" == "proxychains4" ] && command -v proxychains &> /dev/null; then continue; fi
+        if [ "$app" == "netcat-openbsd" ] && command -v nc &> /dev/null; then continue; fi
         MISSING_APPS+=("$app")
     fi
 done
 
 if [ ${#MISSING_APPS[@]} -gt 0 ]; then
-    echo -e "${YELLOW}[!] Установка недостающих пакетов (может потребоваться пароль)...${NC}"
+    echo -e "${YELLOW}[!] Установка недостающих пакетов...${NC}"
     sudo apt update -y >/dev/null 2>&1
     sudo apt install -y "${MISSING_APPS[@]}" >/dev/null 2>&1
 fi
 
-# Автоустановка subfinder, если его нет (через GitHub API)
 if ! command -v subfinder &> /dev/null; then
     echo -e "${YELLOW}[!] Установка subfinder с GitHub...${NC}"
     SUB_URL=$(curl -s https://api.github.com/repos/projectdiscovery/subfinder/releases/latest | grep "browser_download_url.*linux_amd64.zip" | cut -d '"' -f 4)
@@ -88,26 +88,42 @@ if ! command -v subfinder &> /dev/null; then
         sudo mv /tmp/subfinder /usr/local/bin/
         sudo chmod +x /usr/local/bin/subfinder
         rm -f /tmp/subfinder.zip
-    else
-        echo -e "${RED}[-] Не удалось скачать subfinder автоматически.${NC}"
     fi
+fi
+
+# --- АВТОНАСТРОЙКА TOR ---
+echo -e "${YELLOW}[*] Проверка конфигурации Tor...${NC}"
+TORRC="/etc/tor/torrc"
+NEED_RESTART=0
+
+# Проверяем и добавляем ControlPort
+if ! grep -q "^ControlPort 9051" "$TORRC" 2>/dev/null; then
+    echo -e "${YELLOW}[!] Включение ControlPort 9051 в Tor...${NC}"
+    echo "ControlPort 9051" | sudo tee -a "$TORRC" >/dev/null
+    NEED_RESTART=1
+fi
+
+# Проверяем и отключаем авторизацию по куки (чтобы скрипт мог менять IP без пароля)
+if ! grep -q "^CookieAuthentication 0" "$TORRC" 2>/dev/null; then
+    echo "CookieAuthentication 0" | sudo tee -a "$TORRC" >/dev/null
+    NEED_RESTART=1
+fi
+
+if [ $NEED_RESTART -eq 1 ]; then
+    echo -e "${YELLOW}[*] Перезапуск Tor для применения настроек...${NC}"
+    sudo systemctl restart tor 2>/dev/null || sudo service tor restart 2>/dev/null || true
+    sleep 3
 fi
 
 # --- ЗАПУСК И ПРОВЕРКА TOR ---
 if ! pgrep -x "tor" > /dev/null; then
     echo -e "${YELLOW}[*] Запуск службы Tor...${NC}"
-    # Пытаемся запустить через systemctl (Ubuntu/Debian)
-    sudo systemctl start tor 2>/dev/null || \
-    # Если WSL или нет systemd, пробуем через service
-    sudo service tor start 2>/dev/null || \
-    # Если всё упало, запускаем Tor напрямую в фоне (WSL-совместимость)
-    (sudo tor > /dev/null 2>&1 &)
+    sudo systemctl start tor 2>/dev/null || sudo service tor start 2>/dev/null || (sudo tor > /dev/null 2>&1 &)
 fi
 
 echo -n -e "${YELLOW}[*] Ожидание подключения Tor (порт 9050)${NC}"
 TOR_READY=0
 for i in {1..15}; do
-    # Проверяем открыт ли порт 9050 (SOCKS)
     if nc -z -w 1 127.0.0.1 9050 2>/dev/null; then
         TOR_READY=1
         break
@@ -118,20 +134,32 @@ done
 echo ""
 
 if [ $TOR_READY -eq 0 ]; then
-    echo -e "${RED}[-][Ошибка] Tor не запустился или порт 9050 закрыт.${NC}"
-    echo -e "${YELLOW}[!] Попробуйте перезапустить WSL или проверить логи Tor.${NC}"
+    echo -e "${RED}[-][Ошибка] Tor не запустился.${NC}"
     exit 1
 fi
-echo -e "${GREEN}[+] Tor успешно запущен и слушает порт 9050.${NC}"
+echo -e "${GREEN}[+] Tor успешно запущен.${NC}"
 
 PC_CMD="proxychains4"
 command -v proxychains4 &> /dev/null || PC_CMD="proxychains"
 
+# --- УМНАЯ ФУНКЦИЯ РОТАЦИИ IP ---
 rotate_tor_ip() {
-    if nc -z -w 1 127.0.0.1 9051 2>/dev/null; then
-        echo -e 'AUTHENTICATE ""\nSIGNAL NEWNYM\nQUIT' | nc -w 1 127.0.0.1 9051 &>/dev/null
+    echo -e "${YELLOW}  [🔄] Запрос новой Tor-ноды...${NC}"
+    OLD_IP=$(curl -s --socks5 127.0.0.1:9050 https://api.ipify.org 2>/dev/null || echo "unknown")
+    
+    # Отправляем сигнал NEWNYM (Новая личность)
+    echo -e 'AUTHENTICATE ""\nSIGNAL NEWNYM\nQUIT' | nc -w 1 127.0.0.1 9051 &>/dev/null
+    
+    # Ждем, пока IP изменится (максимум 10 секунд)
+    for i in {1..5}; do
         sleep 2
-    fi
+        NEW_IP=$(curl -s --socks5 127.0.0.1:9050 https://api.ipify.org 2>/dev/null || echo "unknown")
+        if [ "$NEW_IP" != "$OLD_IP" ] && [ "$NEW_IP" != "unknown" ]; then
+            echo -e "${GREEN}  [+] IP успешно изменен: $OLD_IP -> $NEW_IP${NC}"
+            return 0
+        fi
+    done
+    echo -e "${YELLOW}  [!] Не удалось сменить IP (Tor работает медленно).${NC}"
 }
 
 draw_status() {
@@ -161,7 +189,7 @@ BASE_SUBNET=$(echo "$MAIN_IP" | cut -d'.' -f1-3)
 
 raw_subs="$TARGET"
 if command -v subfinder &> /dev/null; then
-    echo -e "${YELLOW}[*] Поиск поддоменов через subfinder (может занять время)...${NC}"
+    echo -e "${YELLOW}[*] Поиск поддоменов через subfinder...${NC}"
     sub_out=$(timeout 120 subfinder -d "$TARGET" -silent 2>/dev/null || true)
     if [ -n "$sub_out" ]; then
         raw_subs="${raw_subs}"$'\n'"${sub_out}"
@@ -193,15 +221,35 @@ for i in "${!subdomains[@]}"; do
     if [ -n "$SUB_IP" ]; then
         if echo "$SUB_IP" | grep -qE "^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)"; then continue; fi
 
-        web_headers=$($PC_CMD curl -k -s -I -L -m 5 "https://$sub" 2>/dev/null || $PC_CMD curl -k -s -I -L -m 5 "http://$sub" 2>/dev/null || true)
+        RETRIES=3
+        is_blocked="Нет"
+        web_headers=""
+        http_status=""
         
+        for ((r=1; r<=RETRIES; r++)); do
+            web_headers=$($PC_CMD curl -k -s -I -L -m 10 "https://$sub" 2>/dev/null || $PC_CMD curl -k -s -I -L -m 10 "http://$sub" 2>/dev/null || true)
+            http_status=$(echo "$web_headers" | grep -i "^HTTP/" | tail -1 | awk '{print $2}' || true)
+            
+            if [[ "$http_status" =~ ^(403|429|503)$ ]] || [ -z "$http_status" ]; then
+                if [ $r -lt $RETRIES ]; then
+                    rotate_tor_ip
+                else
+                    is_blocked="Да"
+                fi
+            else
+                break
+            fi
+        done
+
         is_zerotrust="Нет"
         if echo "$web_headers" | grep -qiE "cloudflare-access|cfp-cookie|oauth|sso|identity|beyondcorp|okta|keycloak|login\.|auth0"; then
             is_zerotrust="Да"
         fi
 
         if [ "$is_zerotrust" == "Да" ]; then
-            REPORT_ZERO_TRUST="${REPORT_ZERO_TRUST}\n  [🔒 ZERO TRUST] Хост: $sub -> IP: $SUB_IP"
+            REPORT_ZERO_TRUST="${REPORT_ZERO_TRUST}\n  [🔒 ZERO TRUST] Хост: $sub -> IP: $SUB_IP (Авторизация)"
+        elif [ "$is_blocked" == "Да" ]; then
+            REPORT_ZERO_TRUST="${REPORT_ZERO_TRUST}\n  [🛡️ WAF/TOR BLOCK] Хост: $sub -> IP: $SUB_IP (Статус: $http_status)"
         else
             if [[ "$SUB_IP" != "$BASE_SUBNET".* ]]; then type_label="🔥 КРИТИЧЕСКИЙ BYPASS"; else type_label="📌 ГОЛЫЙ УЗЕЛ"; fi
             
@@ -235,28 +283,29 @@ if [ "$MODE" == "sW" ]; then
             ip="${TARGET_IPS[$i]}"
             
             echo -e "\n${MAGENTA}[⚔️ АТАКА] -> $host [$ip]${NC}"
+            
             rotate_tor_ip
             
-            echo -e "${BLUE}  [1/2] Поиск дыр в службах (Nmap Vuln)...${NC}"
-            nmap_out=$(timeout 60 $PC_CMD nmap -sT -PN -p 80,443,22,8080 -sV --script=vuln --max-rtt-timeout 4s --max-retries 1 "$ip" 2>/dev/null || true)
+            echo -e "${BLUE}  [1/2] Быстрый скан портов и баннеров (Nmap)...${NC}"
+            nmap_out=$(timeout 60 $PC_CMD nmap -sT -Pn -p 80,443,22,8080 -sV --version-light --max-rtt-timeout 5s --max-retries 2 "$ip" 2>/dev/null || true)
             
-            if echo "$nmap_out" | grep -qi "VULNERABLE"; then
-                echo -e "${RED}  [🚨 ВЗЛОМ] Найдены уязвимости служб на $host!${NC}"
-                REPORT_VULNS="${REPORT_VULNS}\n  [❌ СЛУЖБА] $host ($ip) — Уязвимые порты."
-                echo "$nmap_out" | grep -iE "VULNERABLE|State:|IDs:" | sed 's/^/      /'
+            if echo "$nmap_out" | grep -qi "open"; then
+                echo -e "${YELLOW}  [+] Nmap нашел открытые порты.${NC}"
+                REPORT_VULNS="${REPORT_VULNS}\n  [⚠️ ОТКРЫТ] $host ($ip) — Открыты порты."
+                echo "$nmap_out" | grep -iE "^[0-9]+/tcp" | sed 's/^/      /'
             else
-                echo -e "${GREEN}  [+] Nmap завершен (прямых дыр не обнаружено).${NC}"
+                echo -e "${GREEN}  [+] Nmap завершен (порты закрыты или WAF).${NC}"
             fi
 
             echo -e "${BLUE}  [2/2] Поиск веб-уязвимостей (Nikto)...${NC}"
-            nikto_out=$(timeout 90 $PC_CMD nikto -h "https://$host" -Tuning 1,3,4 -maxtime 60s 2>/dev/null || true)
+            nikto_out=$(timeout 120 $PC_CMD nikto -h "https://$host" -Tuning 1,2,3,4 -maxtime 90s -timeout 10 2>/dev/null || true)
             
             if echo "$nikto_out" | grep -qiE "OSVDB|Vulnerability|XSS|Remote|Sensitive"; then
                 echo -e "${RED}  [🚨 ВЗЛОМ] Найдены веб-бреши на $host!${NC}"
                 REPORT_VULNS="${REPORT_VULNS}\n  [❌ ВЕБ-ДЫРА] $host ($ip) — Критические веб-мисконфиги."
                 echo "$nikto_out" | grep -iE "OSVDB|Vulnerability|+ " | head -n 5 | sed 's/^/      /'
             else
-                echo -e "${GREEN}  [+] Nikto завершен (критических утечек не найдено).${NC}"
+                echo -e "${GREEN}  [+] Nikto завершен (дыр не найдено или WAF блокирует).${NC}"
             fi
             echo -e "${YELLOW}--------------------------------------------------------------------------------${NC}"
         done
@@ -283,7 +332,7 @@ if [ "$MODE" == "sQ" ] && [ -n "$REPORT_WEB_TECH" ]; then
 fi
 
 echo -e "--------------------------------------------------------------------------------"
-echo -e "${CYAN}[+] ПРИКРЫТО ZERO TRUST / SSO:${NC}"
+echo -e "${CYAN}[+] ПРИКРЫТО ZERO TRUST / SSO / WAF:${NC}"
 if [ -n "$REPORT_ZERO_TRUST" ]; then echo -e "$REPORT_ZERO_TRUST"; else echo -e "  [-] Не зафиксировано."; fi
 
 if [ "$MODE" == "sW" ]; then
