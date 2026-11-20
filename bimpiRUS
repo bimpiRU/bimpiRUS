@@ -1,4 +1,5 @@
 #!/bin/bash
+set -uo pipefail
 
 GLOBAL_START=$(date +%s)
 
@@ -60,7 +61,8 @@ else
     echo -e "${BLUE}[*] Контур: ТИХИЙ РЕЖИМ (-sQ) | Картирование сети через Tor | Без сканирования портов.${NC}"
 fi
 
-REQUIRED_APPS=("tor" "proxychains4" "nmap" "nikto" "subfinder" "host" "curl" "whatweb")
+# Проверка зависимостей
+REQUIRED_APPS=("tor" "proxychains4" "nmap" "nikto" "host" "curl" "whatweb" "nc")
 MISSING_APPS=()
 for app in "${REQUIRED_APPS[@]}"; do
     if ! command -v "$app" &> /dev/null; then
@@ -68,46 +70,82 @@ for app in "${REQUIRED_APPS[@]}"; do
         MISSING_APPS+=("$app")
     fi
 done
+
 if [ ${#MISSING_APPS[@]} -gt 0 ]; then
-    echo -e "${YELLOW}[!] Дозагрузка необходимых инструментов...${NC}"
-    sudo apt update -y && sudo apt install -y "${MISSING_APPS[@]}" &>/dev/null
+    echo -e "${YELLOW}[!] Установка недостающих пакетов (может потребоваться пароль)...${NC}"
+    sudo apt update -y >/dev/null 2>&1
+    sudo apt install -y "${MISSING_APPS[@]}" >/dev/null 2>&1
 fi
 
-if ! systemctl is-active --quiet tor; then sudo systemctl start tor && sleep 4; fi
+# Проверка и запуск Tor
+if ! systemctl is-active --quiet tor 2>/dev/null; then 
+    echo -e "${YELLOW}[*] Запуск службы Tor...${NC}"
+    sudo systemctl start tor 2>/dev/null || true
+fi
+
+echo -e "${YELLOW}[*] Ожидание подключения к сети Tor (до 30 сек)...${NC}"
+TOR_READY=0
+for i in {1..15}; do
+    if curl -s --socks5 127.0.0.1:9050 -m 3 "https://check.torproject.org/api/ip" 2>/dev/null | grep -q "IsTor\":true"; then
+        TOR_READY=1
+        break
+    fi
+    sleep 2
+done
+
+if [ $TOR_READY -eq 0 ]; then
+    echo -e "${RED}[-][Ошибка] Tor не запустился или не может подключиться. Проверьте работу Tor.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}[+] Tor успешно подключен. Проксируем трафик.${NC}"
+
 PC_CMD="proxychains4"
 command -v proxychains4 &> /dev/null || PC_CMD="proxychains"
 
 rotate_tor_ip() {
+    # Работает только если в /etc/tor/torrc настроен ControlPort 9051
     if nc -z -w 1 127.0.0.1 9051 2>/dev/null; then
         echo -e 'AUTHENTICATE ""\nSIGNAL NEWNYM\nQUIT' | nc -w 1 127.0.0.1 9051 &>/dev/null
+        sleep 2
     fi
 }
 
 draw_status() {
     local percent=$1; local current=$2; local total=$3; local start_time=$4; local cmd_info=$5
     local now=$(date +%s); local elapsed=$((now - start_time)); local eta_str="0s"
+    
     if [ $current -gt 0 ] && [ $elapsed -gt 0 ]; then
         local remaining_seconds=$(( (total - current) * elapsed / current ))
         if [ $remaining_seconds -gt 0 ]; then eta_str="${remaining_seconds}s"; fi
     fi
-    local completed=$((percent / 5)); local remaining=$((20 - completed))
-    local progress_bar=$(printf "%0s" | tr ' ' '='); local empty_bar=$(printf "%0s" | tr ' ' '.')
-    printf "\r\033[K${CYAN}[Прогресс: %3d%% Осталось: %-4s] ${MAGENTA}Анализ: %-40s${NC}" "$percent" "$eta_str" "${cmd_info:0:40}"
+    
+    local completed=$((percent / 5))
+    local remaining=$((20 - completed))
+    local progress_bar=$(printf "%-${completed}s" | tr ' ' '=')
+    local empty_bar=$(printf "%-${remaining}s" | tr ' ' '.')
+    
+    printf "\r\033[K${CYAN}[${progress_bar}${empty_bar}] %3d%% ${MAGENTA}Анализ: %-30s${NC}" "$percent" "${cmd_info:0:30}"
 }
 
-echo -e "\n${YELLOW}[*] Шаг 1: Сканирование инфраструктуры и оценка рентабельности целей...${NC}"
-MAIN_IP=$(host "$TARGET" | grep -m1 "has address" | awk '{print $4}')
+echo -e "\n${YELLOW}[*] Шаг 1: Сканирование инфраструктуры и оценка целей...${NC}"
+MAIN_IP=$(host "$TARGET" | grep -m1 "has address" | awk '{print $4}' || true)
 if [ -z "$MAIN_IP" ]; then
-    echo -e "${RED}[-][Ошибка] Не удалось разрешить IP для $TARGET. Проверьте соединение.${NC}"
+    echo -e "${RED}[-][Ошибка] Не удалось разрешить IP для $TARGET.${NC}"
     exit 1
 fi
 BASE_SUBNET=$(echo "$MAIN_IP" | cut -d'.' -f1-3)
 
+# Всегда добавляем сам целевой домен в начало списка
+raw_subs="$TARGET"
+
 if command -v subfinder &> /dev/null; then
-    raw_subs=$(timeout 30 subfinder -d "$TARGET" -silent 2>/dev/null)
-fi
-if [ -z "$raw_subs" ]; then
-    raw_subs=$(echo -e "www.${TARGET}\nmail.${TARGET}\ndev.${TARGET}\napi.${TARGET}\ntest.${TARGET}\nstaging.${TARGET}\ndemo.${TARGET}\nvod.${TARGET}")
+    echo -e "${YELLOW}[*] Поиск поддоменов через subfinder (может занять время)...${NC}"
+    sub_out=$(timeout 120 subfinder -d "$TARGET" -silent 2>/dev/null || true)
+    if [ -n "$sub_out" ]; then
+        raw_subs="${raw_subs}"$'\n'"${sub_out}"
+    fi
+else
+    echo -e "${YELLOW}[!] subfinder не установлен. Проверяем только корневой домен.${NC}"
 fi
 
 readarray -t subdomains < <(echo "$raw_subs" | sort -u)
@@ -118,39 +156,48 @@ TARGET_IPS=()
 REPORT_PROFITABLE=""
 REPORT_ZERO_TRUST=""
 REPORT_WEB_TECH=""
+REPORT_VULNS=""
 
 STAGE_START=$(date +%s)
 for i in "${!subdomains[@]}"; do
     sub="${subdomains[$i]}"
+    # Убираем пустые строки
+    [ -z "$sub" ] && continue
+    
     CURRENT_TASK=$((i + 1))
     PERCENT=$(( CURRENT_TASK * 100 / TOTAL_SUBS ))
     
     draw_status "$PERCENT" "$CURRENT_TASK" "$TOTAL_SUBS" "$STAGE_START" "Чек: $sub"
     
-    SUB_IP=$(host -W 1 "$sub" | grep -m1 "has address" | awk '{print $4}')
+    SUB_IP=$(host -W 1 "$sub" | grep -m1 "has address" | awk '{print $4}' || true)
+    
     if [ -n "$SUB_IP" ]; then
-        if echo "$SUB_IP" | grep -qE "^185\.65\.150\."; then continue; fi
-
-        web_headers=$($PC_CMD curl -s -I -m 3 "http://$sub" "https://$sub" 2>/dev/null)
-        
-        is_zerotrust="Нет"
-        if echo "$web_headers" | grep -qiE "cloudflare-access|cfp-cookie|oauth|sso|identity|beyondcorp|okta|keycloak|login\."; then
-            is_zerotrust="Да (Zero Trust / SSO Gateway)"
+        # Проверка на локальные сети (чтоб не сканить себя)
+        if echo "$SUB_IP" | grep -qE "^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)"; then 
+            continue 
         fi
 
-        if [ "$is_zerotrust" != "Нет" ]; then
-            REPORT_ZERO_TRUST="${REPORT_ZERO_TRUST}\n  [🔒 ZERO TRUST] Хост: $sub -> IP: $SUB_IP (Защищено экраном авторизации)"
+        # Пытаемся получить заголовки через HTTPS (следуя редиректам), если нет - через HTTP
+        web_headers=$($PC_CMD curl -k -s -I -L -m 5 "https://$sub" 2>/dev/null || $PC_CMD curl -k -s -I -L -m 5 "http://$sub" 2>/dev/null || true)
+        
+        is_zerotrust="Нет"
+        if echo "$web_headers" | grep -qiE "cloudflare-access|cfp-cookie|oauth|sso|identity|beyondcorp|okta|keycloak|login\.|auth0"; then
+            is_zerotrust="Да"
+        fi
+
+        if [ "$is_zerotrust" == "Да" ]; then
+            REPORT_ZERO_TRUST="${REPORT_ZERO_TRUST}\n  [🔒 ZERO TRUST] Хост: $sub -> IP: $SUB_IP (Авторизация)"
         else
             if [[ "$SUB_IP" != "$BASE_SUBNET".* ]]; then type_label="🔥 КРИТИЧЕСКИЙ BYPASS"; else type_label="📌 ГОЛЫЙ УЗЕЛ"; fi
             
-            printf "\r\033[K[${type_label}] Хост: %-30s -> IP: %-15s\n" "$sub" "$SUB_IP"
+            printf "\r\033[K[${type_label}] Хост: %-35s -> IP: %-15s\n" "$sub" "$SUB_IP"
             
             TARGET_HOSTS+=("$sub")
             TARGET_IPS+=("$SUB_IP")
             REPORT_PROFITABLE="${REPORT_PROFITABLE}\n  [$type_label] $sub ($SUB_IP)"
             
             if [ "$MODE" == "sQ" ]; then
-                w_out=$($PC_CMD whatweb --max-threads=4 "$sub" 2>/dev/null | grep -oP 'HTTPServer\[.*?\]|Title\[.*?\]|CMS\[.*?\]' | tr '\n' ' ')
+                w_out=$($PC_CMD whatweb --max-threads=4 "$sub" 2>/dev/null | grep -oP 'HTTPServer\[.*?\]|Title\[.*?\]|CMS\[.*?\]' | tr '\n' ' ' || true)
                 if [ -n "$w_out" ]; then
                     REPORT_WEB_TECH="${REPORT_WEB_TECH}\n  [🌐 СТЕК] $sub: $w_out"
                 fi
@@ -159,14 +206,13 @@ for i in "${!subdomains[@]}"; do
     fi
 done
 printf "\r\033[K${GREEN}[+] Фаза сбора инфраструктуры успешно завершена.${NC}\n"
-REPORT_VULNS=""
 
 if [ "$MODE" == "sW" ]; then
     TOTAL_ATTACKS=${#TARGET_HOSTS[@]}
     if [ $TOTAL_ATTACKS -eq 0 ]; then
         echo -e "\n${GREEN}[+] Высокорентабельных незащищенных точек не найдено.${NC}"
     else
-        echo -e "\n\n${RED}[*] Шаг 2: Скоростная атака на рентабельные цели ($TOTAL_ATTACKS хостов)...${NC}"
+        echo -e "\n\n${RED}[*] Шаг 2: Атака на рентабельные цели ($TOTAL_ATTACKS хостов)...${NC}"
         echo -e "${YELLOW}--------------------------------------------------------------------------------${NC}"
 
         for i in "${!TARGET_HOSTS[@]}"; do
@@ -176,24 +222,26 @@ if [ "$MODE" == "sW" ]; then
             echo -e "\n${MAGENTA}[⚔️ АТАКА] -> $host [$ip]${NC}"
             rotate_tor_ip
             
-            echo -e "${BLUE}  [1/2] Быстрый поиск дыр в службах (Nmap Fast Vuln)...${NC}"
-            nmap_out=$(timeout 35 $PC_CMD nmap -sT -PN -p 80,443,22,8080 -sV --script=vuln --max-rtt-timeout 3s --max-retries 1 $ip 2>/dev/null)
+            echo -e "${BLUE}  [1/2] Поиск дыр в службах (Nmap Vuln)...${NC}"
+            nmap_out=$(timeout 60 $PC_CMD nmap -sT -PN -p 80,443,22,8080 -sV --script=vuln --max-rtt-timeout 4s --max-retries 1 "$ip" 2>/dev/null || true)
+            
             if echo "$nmap_out" | grep -qi "VULNERABLE"; then
                 echo -e "${RED}  [🚨 ВЗЛОМ] Найдены уязвимости служб на $host!${NC}"
                 REPORT_VULNS="${REPORT_VULNS}\n  [❌ СЛУЖБА] $host ($ip) — Уязвимые порты."
                 echo "$nmap_out" | grep -iE "VULNERABLE|State:|IDs:" | sed 's/^/      /'
             else
-                echo -e "${GREEN}  [+] Nmap завершен быстро (прямых дыр не обнаружено или таймаут).${NC}"
+                echo -e "${GREEN}  [+] Nmap завершен (прямых дыр не обнаружено).${NC}"
             fi
 
-            echo -e "${BLUE}  [2/2] Быстрый поиск веб-уязвимостей (Nikto Light)...${NC}"
-            nikto_out=$(timeout 30 $PC_CMD nikto -h http://$host -Tuning 1,3,4 -maxtime 25s 2>/dev/null)
+            echo -e "${BLUE}  [2/2] Поиск веб-уязвимостей (Nikto)...${NC}"
+            nikto_out=$(timeout 90 $PC_CMD nikto -h "https://$host" -Tuning 1,3,4 -maxtime 60s 2>/dev/null || true)
+            
             if echo "$nikto_out" | grep -qiE "OSVDB|Vulnerability|XSS|Remote|Sensitive"; then
                 echo -e "${RED}  [🚨 ВЗЛОМ] Найдены веб-бреши на $host!${NC}"
                 REPORT_VULNS="${REPORT_VULNS}\n  [❌ ВЕБ-ДЫРА] $host ($ip) — Критические веб-мисконфиги."
-                echo "$nikto_out" | grep -iE "OSVDB|Vulnerability|+ " | head -n 3 | sed 's/^/      /'
+                echo "$nikto_out" | grep -iE "OSVDB|Vulnerability|+ " | head -n 5 | sed 's/^/      /'
             else
-                echo -e "${GREEN}  [+] Nikto завершен быстро (критических утечек не найдено или таймаут).${NC}"
+                echo -e "${GREEN}  [+] Nikto завершен (критических утечек не найдено).${NC}"
             fi
             echo -e "${YELLOW}--------------------------------------------------------------------------------${NC}"
         done
@@ -215,17 +263,17 @@ if [ -n "$REPORT_PROFITABLE" ]; then echo -e "$REPORT_PROFITABLE"; else echo -e 
 
 if [ "$MODE" == "sQ" ] && [ -n "$REPORT_WEB_TECH" ]; then
     echo -e "--------------------------------------------------------------------------------"
-    echo -e "${MAGENTA}[+] ВЫЯВЛЕННЫЙ ТЕХНОЛОГИЧЕСКИЙ СТЕК ВЕБ-УЗЛОВ (WHATWEB):${NC}"
+    echo -e "${MAGENTA}[+] ТЕХНОЛОГИЧЕСКИЙ СТЕК (WHATWEB):${NC}"
     echo -e "$REPORT_WEB_TECH"
 fi
 
 echo -e "--------------------------------------------------------------------------------"
-echo -e "${CYAN}[+] ПРИКРЫТО ПАРАДИГМОЙ ZERO TRUST / IDENTITY SSO:${NC}"
+echo -e "${CYAN}[+] ПРИКРЫТО ZERO TRUST / SSO:${NC}"
 if [ -n "$REPORT_ZERO_TRUST" ]; then echo -e "$REPORT_ZERO_TRUST"; else echo -e "  [-] Не зафиксировано."; fi
 
 if [ "$MODE" == "sW" ]; then
     echo -e "--------------------------------------------------------------------------------"
-    echo -e "${RED}[+] РЕЗУЛЬТАТЫ ПОПЫТОК АВТО-ВЗЛОМА ВЫСОКОРЕНТАБЕЛЬНЫХ ХОСТОВ:${NC}"
-    if [ -n "$REPORT_VULNS" ]; then echo -e "$REPORT_VULNS"; else echo -e "  ${GREEN}[-] Прямых критических уязвимостей в экспресс-режиме не обнаружено.${NC}"; fi
+    echo -e "${RED}[+] РЕЗУЛЬТАТЫ АВТО-ВЗЛОМА:${NC}"
+    if [ -n "$REPORT_VULNS" ]; then echo -e "$REPORT_VULNS"; else echo -e "  ${GREEN}[-] Прямых критических уязвимостей не обнаружено.${NC}"; fi
 fi
 echo -e "${GREEN}================================================================================${NC}"
