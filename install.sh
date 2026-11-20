@@ -5,7 +5,7 @@ set -euo pipefail
 INSTALL_DIR="/usr/local/bin"
 SCRIPT_NAME="bimpiRUS"
 # ВАЖНО: Замени ВАШ_НИК на свой никнейм на GitHub (судя по коммиту, это bimpi)
-SCRIPT_URL="https://raw.githubusercontent.com/ВАШ_НИК/bimpiRUS/main/bimpiRUS"
+SCRIPT_URL="https://raw.githubusercontent.com/bimpiRU/bimpiRUS/main/bimpiRUS"
 
 echo "Устанавливаю bimpiRUS в ${INSTALL_DIR}..."
 
